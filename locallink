@@ -1,0 +1,102 @@
+#! /bin/sh
+
+# locallink - physically relocate dynamically-linked dependencies of an
+#             executable and modify the executable to match
+#
+# Usage:
+#   locallink executable [lib_path]
+#
+# Arguments:
+#   executable  The executable to modify.
+#   lib_path    The path relative to the executable to which libraries should
+#               be relocated.
+#               (default: lib)
+
+DEFAULT_LIB_PATH=lib
+
+set -e
+
+help ()
+{
+    <"$0" awk '
+    $0 !~ /^#/ && found_block == 1 {
+        exit;
+    }
+    NR > 1 && $0 ~ /^#/ {
+        found_block = 1;
+        gsub("^# ?", "");
+        print $0;
+    }'
+}
+
+identify_and_copy_dependencies ()
+{
+    local executable="$1"
+    local executable_name="$(basename "$1")"
+    local lib_path="$2"
+
+    local lib
+    otool -L "$1" \
+        | grep -o '^\t[^ ]\+' \
+        | tr -d '[\t ]' \
+        | grep -v '^@' \
+        | grep -v '^/usr/lib/' \
+        | grep -v '^/System/' \
+        | while read -r lib
+        do
+            lib_name="$(basename "$lib")"
+            new_lib_name="@executable_path/$(basename "$lib_path")/$lib_name"
+
+            # If the link is a self-reference, we just need to update the
+            # library's identity.
+            if [ "$executable_name" = "$lib_name" ]
+            then
+                install_name_tool -id "$new_lib_name" "$executable"
+
+                continue
+            fi
+
+            # Copy the library into the local library path, but only if
+            # necessary: we don't want to overwrite a library we've already
+            # brought in and started to modify which has circular references.
+            if [ ! -r "$lib_path"/"$lib_name" ]
+            then
+                cp "$lib" "$lib_path"
+                chmod +w "$lib_path"/"$lib_name"
+            fi
+
+            # Modify the executable to look for the copied library.
+            install_name_tool -change "$lib" "$new_lib_name" "$executable"
+
+            # Recurse into this library's dependencies.
+            identify_and_copy_dependencies \
+                "$lib_path"/"$lib_name" \
+                "$lib_path"
+        done
+}
+
+main ()
+{
+    if [ $# -lt 1 ] \
+        || [ "$1" = "-h" ] \
+        || [ "$1" = "--help" ] \
+        || [ "$1" = "help" ]
+    then
+        help
+        return
+    fi
+
+    executable="$1"
+
+    lib_path="$2"
+    if [ -z "$lib_path" ]
+    then
+        lib_path="$DEFAULT_LIB_PATH"
+    fi
+    lib_path="$(dirname "$executable")/$lib_path"
+
+    mkdir -p "$lib_path"
+    identify_and_copy_dependencies "$executable" "$lib_path"
+}
+
+main "$@"
